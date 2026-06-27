@@ -1,6 +1,6 @@
 # User Guide After Deployment
 
-This guide explains how to use the project after the pipeline has been deployed and Airflow/Streamlit are running.
+This guide explains how to operate the project after Airflow and Streamlit are running.
 
 ## 1. Main Links
 
@@ -22,34 +22,45 @@ Start Airflow:
 docker compose up airflow-webserver airflow-scheduler
 ```
 
-Start Streamlit:
+Start Streamlit from the repo root:
 
 ```bash
 streamlit run dashboard.py
+```
+
+Optional JupyterLab:
+
+```bash
+docker compose up jupyter
+```
+
+```text
+http://localhost:8888
 ```
 
 ## 2. What Runs Where
 
 | Tool | Purpose |
 | --- | --- |
-| Airflow | Runs the main historical DAG and simulation DAG. |
+| Airflow | Runs the historical `dag` and `simulation_inference_dag`. |
 | Python scripts | Process data, train models, infer predictions, monitor drift, and evaluate performance. |
-| Streamlit | Displays results after Airflow/scripts have created output files. |
+| Streamlit | Reads generated files and displays monitoring, predictions, registry, performance, and EDA. |
+| JupyterLab | Optional notebook-style exploration and debugging. |
 
-The dashboard is read-only. It does not trigger training, inference, monitoring, or simulation.
+The dashboard is read-only. It does not trigger training, inference, monitoring, simulation, or performance evaluation.
 
 ## 3. Normal Operating Flow
 
-For historical pipeline execution:
+Historical run:
 
 ```text
 Start Airflow
   -> run or unpause dag
-  -> wait for historical backfill to complete
+  -> wait for historical backfill through 2024-12-01
   -> review outputs in Streamlit
 ```
 
-For future simulation:
+Future simulation:
 
 ```text
 Start Airflow
@@ -58,7 +69,7 @@ Start Airflow
   -> refresh Streamlit
 ```
 
-For dashboard review:
+Dashboard review:
 
 ```text
 Start Streamlit
@@ -68,14 +79,12 @@ Start Streamlit
 
 ## 4. Airflow DAGs
 
-There are two main DAGs:
-
 | DAG | When to use |
 | --- | --- |
-| `dag` | Historical production-style pipeline from January 2023 to December 2024. |
-| `simulation_inference_dag` | Manual synthetic future simulation after the main DAG has created gold data and a model. |
+| `dag` | Historical production-style pipeline from `2023-01-01` to `2024-12-01`. |
+| `simulation_inference_dag` | Manual synthetic future simulation after the historical DAG has created gold data and models. |
 
-Trigger the main DAG:
+Trigger the historical DAG:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger dag
@@ -96,19 +105,16 @@ docker compose run --rm airflow-webserver airflow dags trigger simulation_infere
 
 ## 5. Reading Airflow
 
-Green tasks mean success.
+Green tasks mean success. Red tasks mean failure and should be checked from the task log.
 
-Pink skipped tasks are usually expected because the DAG uses branches. For example, if training is not due, the training task may be skipped and the skip branch succeeds.
-
-Red tasks mean failure and should be checked from the task log.
-
-Common expected skips:
+Pink skipped tasks are usually expected because both DAGs use branches. Common expected skips:
 
 ```text
 scheduled training skipped because the 3-month interval has not passed
-inference skipped because predictions already exist
-monitoring skipped because no eligible monitoring snapshot exists
-retraining skipped because PSI did not require retraining
+XGBoost or logistic-regression retraining skipped because PSI did not require retraining
+simulation inference skipped because predictions already exist
+simulation monitoring skipped because monitoring was disabled or no eligible snapshots exist
+simulation evaluation skipped because labels have not matured yet
 ```
 
 ## 6. Streamlit Dashboard Navigation
@@ -126,39 +132,40 @@ EDA
 Use this page to answer:
 
 ```text
-Which model is active?
+Which model version is selected?
 Is model score drift healthy?
 Which features are drifting?
 Does the model need retraining?
 How has PSI/CSI changed over time?
+How does matured-label performance look?
 ```
 
 Important tabs:
 
 | Tab | Purpose |
 | --- | --- |
-| Drift Overview | PSI trend, max CSI trend, current drift status. |
+| Drift Overview | PSI trend, max CSI trend, latest drift status. |
 | Feature Drift | CSI by feature for a selected snapshot. |
-| Model Registry | Champion/challenger model records from `model_log.csv`. |
+| Model Registry | Champion/challenger records from `model_bank/model_log.csv`. |
 | Model Performance | Metrics after predictions are compared with matured labels. |
 
 PSI interpretation:
 
 ```text
-PSI < 0.10       -> healthy
-0.10 to 0.25    -> warning
-PSI >= 0.25     -> retrain_required
+PSI < 0.10    -> healthy
+0.10 to 0.25 -> warning
+PSI >= 0.25  -> retrain_required
 ```
 
 CSI interpretation:
 
 ```text
-CSI < 0.10       -> healthy
-0.10 to 0.25    -> warning
-CSI >= 0.25     -> material feature drift
+CSI < 0.10    -> healthy
+0.10 to 0.25 -> warning
+CSI >= 0.25  -> material feature drift
 ```
 
-CSI helps explain what moved. PSI is the retraining trigger in the current setup.
+PSI is the retraining trigger in the current setup. CSI is diagnostic and helps explain what moved.
 
 ### Predictions
 
@@ -178,12 +185,21 @@ Important fields:
 | Field | Meaning |
 | --- | --- |
 | `model_predictions` | Calibrated model probability. |
-| `prediction_threshold` | Probability cutoff selected during training. |
-| `label` | Model-predicted binary class, not the actual future label. |
+| `prediction_threshold` | Probability cutoff selected during training or supplied as an override. |
+| `label` | Model-predicted binary class in prediction output files. |
+| `predicted_label` | Renamed prediction label used inside performance evaluation. |
+| `actual_label` | Matured label joined from the label store during performance evaluation. |
+
+Prediction outputs are stored under:
+
+```text
+datamart/gold/model_predictions/<model_version>/
+datamart/gold/model_predictions_csv/<model_version>/
+```
 
 ### EDA
 
-Use this page to inspect raw pipeline outputs:
+Use this page to inspect pipeline outputs:
 
 ```text
 bronze partitions
@@ -195,7 +211,7 @@ column summaries
 missing values
 ```
 
-This is useful when drift or performance changes might be caused by data changes rather than model behavior.
+EDA is useful when drift or performance changes may be caused by data movement rather than model behavior.
 
 ## 7. Model Registry
 
@@ -205,31 +221,51 @@ The model registry is stored in:
 model_bank/model_log.csv
 ```
 
-It records model metadata such as:
+It records:
 
 ```text
-model name
+model_version
+model_type
 training date
-train/test/OOT periods
-selected threshold
+AUC/Gini/Brier/log-loss metrics
 calibration method
+selected threshold
+threshold selection metric
 champion/challenger status
-performance metrics
+```
+
+Model artifacts are stored as:
+
+```text
+model_bank/credit_model_<model_type>_YYYY_MM_DD_vN.pkl
 ```
 
 Champion model:
 
 ```text
-the active model used by default for inference
+the active model selected by default for inference, monitoring, and evaluation
 ```
 
 Challenger model:
 
 ```text
-a valid model candidate that did not replace the champion
+the best non-champion model by registry reconciliation, or a newly staged model that beats the champion on test and OOT AUC
 ```
 
-## 8. Prediction Performance
+The registry can be reconciled from valid `.pkl` artifacts by `scripts/ML_model/model_registry.py`. Reconciliation preserves one valid existing champion when possible; otherwise it promotes the best available artifact by OOT, test, and train AUC.
+
+## 8. Model Families
+
+The historical DAG trains, infers, monitors, and retrains both:
+
+```text
+xgboost
+log_reg
+```
+
+Inference and monitoring are model-type aware in the historical DAG. When a specific `model_name` is supplied, it must match the expected model type for that task.
+
+## 9. Prediction Performance
 
 Prediction performance uses the 6-month label maturity rule:
 
@@ -261,9 +297,12 @@ Precision
 Recall
 F1
 score-band calibration
+monthly matured prediction performance
 ```
 
-## 9. Refreshing Data
+The evaluator writes one overall row for all matured predictions and one row per matured prediction snapshot.
+
+## 10. Refreshing Data
 
 After a DAG run finishes:
 
@@ -280,7 +319,7 @@ datamart/gold/model_monitoring/
 datamart/gold/model_performance/
 ```
 
-## 10. Common Troubleshooting
+## 11. Common Troubleshooting
 
 ### DAG changes do not appear
 
@@ -290,15 +329,29 @@ Restart Airflow:
 docker compose restart airflow-scheduler airflow-webserver
 ```
 
+### Historical inference has no model
+
+Check:
+
+```text
+gold feature and label stores exist
+FIRST_TRAINING_DATE has enough historical data
+model_bank exists as a directory
+model_bank/model_log.csv can be reconciled
+```
+
+If no champion exists, inference can attempt bootstrap training for `2024-09-01`.
+
 ### Simulation did not infer new months
 
 Likely causes:
 
 ```text
-prediction files already exist
+prediction files already exist for the selected model version
 synthetic gold feature partitions were not created
 max_snapshotdate is too early
-no champion model exists
+infer_through_latest_gold changed the effective upper bound
+no valid champion or requested model exists
 ```
 
 ### Dashboard shows only one snapshot date
@@ -335,10 +388,10 @@ label partitions exist for prediction month + 6
 Customer_ID values overlap between predictions and labels
 ```
 
-## 11. Daily User Checklist
+## 12. Daily User Checklist
 
 1. Open Airflow and confirm DAG runs are successful.
-2. Open Streamlit and select the champion model.
+2. Open Streamlit and select the relevant model version.
 3. Review Drift Overview for PSI status.
 4. Review Feature Drift for high-CSI features.
 5. Review Predictions for scored volume and probability distribution.

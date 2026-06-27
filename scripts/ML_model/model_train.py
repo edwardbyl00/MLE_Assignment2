@@ -13,6 +13,7 @@ from pyspark.sql.types import NumericType
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import ParameterSampler, train_test_split
 from sklearn.pipeline import Pipeline
@@ -127,8 +128,11 @@ def _select_prediction_threshold(y_true, probabilities):
     return selected_result, threshold_results
 
 
-def train_model(date_str, spark):
+def train_model(date_str, spark, model_type="xgboost"):
     """Train, evaluate, save, and register a versioned credit-risk model."""
+    if model_type not in {"xgboost", "log_reg"}:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
     # The label is observed after a 6-month MOB window, so training joins each
     # label month back to features from six months earlier.
     train_test_period_months = 12
@@ -284,17 +288,43 @@ def train_model(date_str, spark):
     X_test_processed = fitted_preprocessor.transform(X_test)
     X_oot_processed = fitted_preprocessor.transform(X_oot)
 
-    param_dist = {
-        "n_estimators": [25, 30, 35],
-        "max_depth": [2, 4, 6],
-        "learning_rate": [0.01, 0.1],
-        "subsample": [0.6, 0.8],
-        "colsample_bytree": [0.6, 0.8],
-        "gamma": [0, 0.1],
-        "min_child_weight": [1, 3, 5],
-        "reg_alpha": [0, 0.1, 1],
-        "reg_lambda": [1, 1.5, 2],
-    }
+    if model_type == "xgboost":
+        param_dist = {
+            "n_estimators": [25, 30, 35],
+            "max_depth": [2, 4, 6],
+            "learning_rate": [0.01, 0.1],
+            "subsample": [0.6, 0.8],
+            "colsample_bytree": [0.6, 0.8],
+            "gamma": [0, 0.1],
+            "min_child_weight": [1, 3, 5],
+            "reg_alpha": [0, 0.1, 1],
+            "reg_lambda": [1, 1.5, 2],
+        }
+
+        def make_candidate_model(params):
+            return xgb.XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="auc",
+                random_state=88,
+                n_jobs=-1,
+                **params,
+            )
+
+    else:
+        param_dist = {
+            "C": [0.01, 0.1, 1.0, 10.0],
+            "penalty": ["l2"],
+            "solver": ["lbfgs"],
+            "class_weight": [None, "balanced"],
+            "max_iter": [500, 1000],
+        }
+
+        def make_candidate_model(params):
+            return LogisticRegression(
+                random_state=88,
+                n_jobs=-1,
+                **params,
+            )
 
     best_model = None
     best_params = None
@@ -308,13 +338,7 @@ def train_model(date_str, spark):
     )
     for index, params in enumerate(sampled_params, start=1):
         # Use a bounded random search to keep DAG runtime predictable.
-        candidate_model = xgb.XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="auc",
-            random_state=88,
-            n_jobs=-1,
-            **params,
-        )
+        candidate_model = make_candidate_model(params)
         candidate_model.fit(X_train_processed, y_train)
         candidate_auc = roc_auc_score(
             y_test,
@@ -396,7 +420,7 @@ def train_model(date_str, spark):
     print(f"OOT    AUC={oot_auc_score:.4f}  GINI={round(2 * oot_auc_score - 1, 3)}")
 
     model_bank_directory = ensure_directory("/opt/airflow/model_bank/")
-    base_version = "credit_model_" + date_str.replace("-", "_")
+    base_version = "credit_model_" + model_type + "_" + date_str.replace("-", "_")
     existing_versions = glob.glob(
         os.path.join(model_bank_directory, base_version + "_v*.pkl")
     )
@@ -407,6 +431,7 @@ def train_model(date_str, spark):
         # model for diagnostics or future comparison.
         "model": final_model,
         "base_model": best_model,
+        "model_type": model_type,
         "model_version": model_version,
         "preprocessing_transformers": {"preprocessor": fitted_preprocessor},
         "data_dates": config,

@@ -1,30 +1,28 @@
 # Simulation Pipeline Using The DAG
 
-This guide explains how to run the synthetic simulation pipeline using:
+This guide explains how to run the synthetic future simulation pipeline:
 
 ```text
 dags/simulation_inference_dag.py
 ```
 
-The simulation DAG is used after the main historical DAG has run. It extends the gold layer with synthetic future data, runs inference, runs monitoring, and evaluates predictions against matured labels.
+The simulation DAG is used after the historical DAG has produced gold data and at least one usable model. It extends the gold layer with synthetic future partitions, runs inference, runs monitoring, and evaluates predictions once labels have matured.
 
 ## 1. Why Simulation Is Needed
 
-The real source data only covers January 2023 to December 2024. The main `dag.py` processes that historical period and then stops at its configured end date.
+The real source data covers `2023-01-01` through `2024-12-01`. The historical `dag` stops at that configured end date.
 
-To test future model operations, the simulation pipeline creates synthetic gold-layer data from January 2025 onward. This lets the project demonstrate the end-to-end model operations flow after the historical data ends.
-
-In short:
+The simulation DAG creates synthetic gold-layer data from `2025-01-01` onward so the project can demonstrate future operations:
 
 ```text
-dag.py
+dag
   -> builds historical bronze/silver/gold data
-  -> trains and registers models
+  -> trains and registers XGBoost and logistic-regression models
   -> runs historical inference and monitoring
 
-simulation_inference_dag.py
-  -> creates synthetic future gold data
-  -> runs inference on synthetic feature months
+simulation_inference_dag
+  -> creates synthetic future gold feature/label partitions
+  -> runs inference for missing prediction months
   -> runs monitoring
   -> evaluates predictions once labels mature
 ```
@@ -36,8 +34,8 @@ Before running simulation:
 1. Airflow is running.
 2. The main `dag` has completed the historical backfill.
 3. Gold feature and label stores exist under `datamart/gold/`.
-4. At least one trained model exists in `model_bank/`.
-5. `model_bank/model_log.csv` contains a champion model.
+4. At least one model artifact exists in `model_bank/`.
+5. `model_bank/model_log.csv` contains or can reconcile a champion model.
 
 Start Airflow if needed:
 
@@ -51,9 +49,30 @@ Airflow UI:
 http://localhost:8080
 ```
 
-## 3. Simulation DAG Flow
+## 3. Simulation DAG Parameters
 
-The DAG flow is:
+The DAG accepts these manual trigger parameters:
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `model_name` | empty | Optional model filename/version. Empty means champion. |
+| `max_snapshotdate` | empty | Optional inference/monitoring upper bound when not inferring through latest gold. |
+| `infer_through_latest_gold` | `true` | Ignore `max_snapshotdate` and score through the latest gold feature partition. |
+| `synthetic_start_date` | empty | First synthetic month. Empty means the month after the latest gold partition. |
+| `synthetic_end_date` | empty | Last synthetic month. Empty means yesterday's month-start partition. |
+| `synthetic_lookback_months` | `12` | Number of recent gold partitions used as the synthetic reference profile. |
+| `synthetic_seed` | `88` | Base random seed. |
+| `synthetic_overwrite` | `false` | Replace existing synthetic partitions in the requested range. |
+| `synthetic_numeric_noise` | `0.02` | Numeric noise as a fraction of each feature's standard deviation. |
+| `synthetic_ratio_lower_quantile` | `0.01` | Lower cap for synthetic ratio fields. |
+| `synthetic_ratio_upper_quantile` | `0.99` | Upper cap for synthetic ratio fields. |
+| `run_monitoring` | `true` | Enable/disable monitoring. |
+| `monitoring_snapshotdate` | empty | Monitor one explicit snapshot. |
+| `monitor_all_snapshotdates` | `true` | Monitor all eligible snapshots instead of one snapshot. |
+| `evaluate_performance` | `true` | Enable/disable matured-label performance evaluation. |
+| `performance_evaluation_date` | empty | Evaluation label horizon. Empty means latest label partition. |
+
+## 4. Simulation DAG Flow
 
 ```text
 generate_synthetic_gold_data
@@ -69,15 +88,17 @@ generate_synthetic_gold_data
   -> simulation_evaluation_completed
 ```
 
-What it does:
+The task name says `xgboost` for historical compatibility, but the inference code can select a user-supplied model or default champion. In the main historical DAG, model-type-specific inference is run separately for XGBoost and logistic regression.
+
+What the simulation DAG does:
 
 1. Generates missing synthetic gold feature and label partitions.
-2. Checks which gold feature months do not already have predictions.
+2. Checks which gold feature months do not already have predictions for the selected model version.
 3. Runs inference only for missing prediction months.
 4. Runs PSI/CSI monitoring for eligible synthetic feature snapshots.
 5. Evaluates predictions against labels once labels have matured.
 
-## 4. How Synthetic Data Is Generated
+## 5. How Synthetic Data Is Generated
 
 Synthetic data is generated by:
 
@@ -88,20 +109,18 @@ scripts/utils/generate_synthetic_gold_data.py
 It writes directly to the gold layer:
 
 ```text
-datamart/gold/feature_store/gold_feature_store_YYYY_MM_01.parquet
-datamart/gold/label_store/gold_label_store_YYYY_MM_01.parquet
+datamart/gold/feature_store/gold_feature_store_YYYY_MM_DD.parquet
+datamart/gold/label_store/gold_label_store_YYYY_MM_DD.parquet
 ```
 
-The simulation does not recreate bronze or silver data for future months. That is intentional because the goal is to test model operations, not raw source ingestion.
+The simulation does not recreate bronze or silver future data. That is intentional because the goal is to test model operations, not raw ingestion.
 
-Feature generation uses whole-row resampling from recent gold feature partitions. This helps preserve relationships between fields such as income, debt, EMI, and derived ratios.
-
-For each synthetic feature month, the generator:
+Feature generation uses whole-row resampling from recent gold feature partitions. For each synthetic feature month, the generator:
 
 1. samples rows with replacement from the reference gold feature pool;
-2. samples the row count from historical partition sizes;
+2. samples row count from historical partition sizes;
 3. adds small numeric noise to non-derived numeric fields;
-4. clips financial fields that should not be negative;
+4. clips non-negative financial fields at zero;
 5. recalculates derived gold fields;
 6. caps ratio features using historical quantile bounds;
 7. assigns the synthetic month as `snapshot_date`.
@@ -115,60 +134,53 @@ high_credit_utilization_flag
 Credit_History_Age_Months
 ```
 
-Default ratio caps:
-
-```text
-synthetic_ratio_lower_quantile = 0.01
-synthetic_ratio_upper_quantile = 0.99
-```
-
-Label generation samples from the historical label distribution. The target `label` uses the observed default rate:
+Label generation samples from the historical default rate:
 
 ```text
 P(label = 1) = mean(label) across reference label partitions
 ```
 
-These labels are useful for pipeline testing, but they are not real future outcomes.
+These labels are useful for pipeline testing, but they are synthetic and should not be interpreted as real future outcomes.
 
-## 5. Run The Simulation DAG
+## 6. Run The Simulation DAG
 
-Trigger the simulation DAG with default settings:
+Trigger with default settings:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger simulation_inference_dag
 ```
 
-Generate and evaluate to a fixed synthetic date:
+Generate and evaluate through June 2026:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger simulation_inference_dag \
   --conf '{"synthetic_end_date":"2026-06-01","max_snapshotdate":"2026-06-01","performance_evaluation_date":"2026-06-01"}'
 ```
 
-Regenerate an existing synthetic range after changing synthetic logic or constraints:
+Regenerate an existing synthetic range:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger simulation_inference_dag \
   --conf '{"synthetic_start_date":"2025-01-01","synthetic_end_date":"2026-06-01","synthetic_overwrite":true,"performance_evaluation_date":"2026-06-01"}'
 ```
 
-Use stricter ratio caps:
+Use stricter synthetic ratio caps:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger simulation_inference_dag \
   --conf '{"synthetic_start_date":"2025-01-01","synthetic_end_date":"2026-06-01","synthetic_overwrite":true,"synthetic_ratio_lower_quantile":0.05,"synthetic_ratio_upper_quantile":0.95,"performance_evaluation_date":"2026-06-01"}'
 ```
 
-Use a specific model:
+Use a specific model artifact:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger simulation_inference_dag \
-  --conf '{"model_name":"credit_model_2024_09_01_v1.pkl"}'
+  --conf '{"model_name":"credit_model_xgboost_2024_09_01_v1.pkl"}'
 ```
 
-## 6. Optional Manual Synthetic Data Generation
+## 7. Optional Manual Synthetic Generation
 
-The DAG is preferred because it runs generation, inference, monitoring, and evaluation together. If you only want to generate synthetic gold partitions:
+The DAG is preferred because it runs generation, inference, monitoring, and evaluation together. To generate only synthetic gold partitions:
 
 ```bash
 python scripts/utils/generate_synthetic_gold_data.py \
@@ -188,9 +200,9 @@ python scripts/utils/generate_synthetic_gold_data.py \
   --overwrite
 ```
 
-## 7. Monitoring Behavior
+## 8. Monitoring Behavior
 
-By default, simulation monitoring runs for every eligible gold feature snapshot from the first model month through the selected synthetic horizon. This creates monthly PSI/CSI trends in Streamlit.
+By default, simulation monitoring runs for every eligible gold feature snapshot from `2024-09-01` through the selected synthetic horizon.
 
 Monitor one snapshot only:
 
@@ -218,10 +230,10 @@ Important concepts:
 PSI -> model score drift
 CSI -> feature drift
 PSI >= 0.25 -> retrain_required
-CSI -> informational, used to diagnose which features moved
+CSI -> informational diagnostic signal
 ```
 
-## 8. Prediction Evaluation Against Labels
+## 9. Prediction Evaluation Against Labels
 
 Prediction performance is evaluated by:
 
@@ -229,7 +241,7 @@ Prediction performance is evaluated by:
 scripts/ML_model/model_performance.py
 ```
 
-The key rule is:
+The maturity rule is:
 
 ```text
 prediction month M -> label month M + 6
@@ -243,7 +255,7 @@ Examples:
 | `2024-12-01` | `2025-06-01` |
 | `2025-12-01` | `2026-06-01` |
 
-If synthetic data only goes to `2026-06-01`, the latest prediction month that can be evaluated is `2025-12-01`. Predictions for `2026-01-01` require labels from `2026-07-01`, so they are not mature yet.
+If synthetic data only goes through `2026-06-01`, the latest prediction month that can be evaluated is `2025-12-01`.
 
 The evaluator joins predictions and labels by:
 
@@ -258,73 +270,23 @@ Outputs are written to:
 datamart/gold/model_performance/<model_version>/
 ```
 
-Important files:
+The performance history includes overall matured-prediction metrics plus monthly rows for each original prediction snapshot.
+
+## 10. Common Simulation Checks
+
+If simulation does not produce new predictions, check:
 
 ```text
-<model_version>_performance_history.parquet
-<model_version>_performance_history.csv
-<model_version>_performance_detail_<YYYY_MM_DD>.parquet
-<model_version>_performance_detail_<YYYY_MM_DD>.csv
+synthetic gold feature partitions exist
+prediction files do not already exist for the selected model version
+max_snapshotdate is not earlier than the synthetic months
+model_bank/model_log.csv has a valid champion or the requested model exists
 ```
 
-Metrics include:
+If evaluation is skipped, check:
 
 ```text
-AUC
-Gini
-Brier score
-Log loss
-Accuracy
-Precision
-Recall
-Specificity
-F1
-Confusion matrix counts
-```
-
-## 9. How To Explain The Simulation End To End
-
-Use this description:
-
-After the main `dag.py` pipeline has completed, the user runs `simulation_inference_dag.py` to simulate future model operations beyond the available historical data. The main DAG first processes real data through bronze, silver, and gold, then trains the model, runs historical inference, performs monitoring, and records outputs. Because real source data stops at the historical cutoff, the simulation DAG is triggered manually to create synthetic gold-layer feature and label partitions. These synthetic partitions follow the distribution of the existing gold data. Once they are created, the simulation DAG checks which gold feature months do not yet have predictions, runs model inference for those months, calculates PSI/CSI monitoring, and evaluates predictions against synthetic labels after the 6-month label maturity period.
-
-In one flow:
-
-```text
-historical gold data
-  -> synthetic gold feature and label generation
-  -> inference on synthetic feature months
-  -> PSI/CSI monitoring
-  -> prediction vs matured label evaluation
-  -> Streamlit dashboard review
-```
-
-The simulation does not prove real future model accuracy. It validates that the model operations pipeline can score future-like data, monitor drift, handle label maturity, calculate performance, and display results correctly.
-
-## 10. Troubleshooting
-
-If inference is skipped:
-
-```text
-the selected model already has predictions for all available gold feature months
-the gold feature partition does not exist
-no champion model exists
-max_snapshotdate is earlier than the available synthetic months
-```
-
-If monitoring is skipped:
-
-```text
-the selected snapshot does not have a prediction file
-the model training reference window cannot be found
-monitoring is disabled by DAG config
-```
-
-If performance evaluation has no rows:
-
-```text
-labels have not matured yet
-prediction files do not exist
-synthetic labels do not overlap enough by Customer_ID
-the evaluation date is too early
+labels have matured by performance_evaluation_date
+prediction month + 6 label partitions exist
+Customer_ID values overlap between prediction and label data
 ```

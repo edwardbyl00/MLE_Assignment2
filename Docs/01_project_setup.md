@@ -1,22 +1,21 @@
 # Project Setup
 
-This guide explains how to set up and run the credit risk ML pipeline locally with Docker, Airflow, Spark/XGBoost scripts, and Streamlit.
+This guide explains how to run the monthly credit-risk ML pipeline locally with Docker, Airflow, Spark, XGBoost/logistic-regression models, and Streamlit.
 
 ## 1. Project Components
 
-The project has three main execution layers:
-
 ```text
-Airflow DAGs      -> orchestrate data processing, training, inference, monitoring, and simulation
-Python scripts    -> perform bronze/silver/gold processing and ML logic
-Streamlit app     -> displays model monitoring, predictions, performance, and EDA
+Airflow DAGs   -> orchestrate data processing, training, inference, monitoring, and simulation
+Python scripts -> build bronze/silver/gold data and run ML lifecycle logic
+Streamlit app  -> displays monitoring, predictions, model registry, performance, and EDA
+JupyterLab     -> optional interactive development service
 ```
 
 Important files:
 
 | Area | File |
 | --- | --- |
-| Main historical DAG | `dags/dag.py` |
+| Historical DAG | `dags/dag.py` |
 | Simulation DAG | `dags/simulation_inference_dag.py` |
 | Dashboard | `dashboard.py` |
 | Synthetic generator | `scripts/utils/generate_synthetic_gold_data.py` |
@@ -24,8 +23,9 @@ Important files:
 | Model inference | `scripts/ML_model/model_inference.py` |
 | Model monitoring | `scripts/ML_model/model_monitoring.py` |
 | Prediction evaluation | `scripts/ML_model/model_performance.py` |
+| Registry reconciliation | `scripts/ML_model/model_registry.py` |
 
-## 2. Folder Mounts
+## 2. Docker Mounts And Outputs
 
 Docker mounts the local project folders into the Airflow container:
 
@@ -45,9 +45,11 @@ datamart/silver/
 datamart/gold/feature_store/
 datamart/gold/label_store/
 datamart/gold/model_predictions/
+datamart/gold/model_predictions_csv/
 datamart/gold/model_monitoring/
 datamart/gold/model_performance/
 model_bank/model_log.csv
+model_bank/*.pkl
 ```
 
 ## 3. Recommended Hardware
@@ -68,15 +70,7 @@ RAM: 16 GB
 Disk: 40 GB free
 ```
 
-Better for repeated training and simulation:
-
-```text
-CPU: 8-12 cores
-RAM: 32 GB
-Disk: 80 GB free
-```
-
-The current Airflow configuration is designed for a laptop or small workstation:
+The compose file uses Airflow `LocalExecutor`:
 
 ```yaml
 AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -85,17 +79,11 @@ AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 8
 AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
 ```
 
-If the machine has limited memory, reduce parallelism:
-
-```yaml
-AIRFLOW__CORE__PARALLELISM: 4
-AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
-AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
-```
+If your machine is memory constrained, reduce `PARALLELISM` and `MAX_ACTIVE_TASKS_PER_DAG` in `docker-compose.yaml`.
 
 ## 4. Start Airflow
 
-Start the Airflow webserver and scheduler:
+Start the webserver and scheduler:
 
 ```bash
 docker compose up airflow-webserver airflow-scheduler
@@ -105,11 +93,6 @@ Open Airflow:
 
 ```text
 http://localhost:8080
-```
-
-Default login:
-
-```text
 username: admin
 password: admin
 ```
@@ -120,18 +103,34 @@ If DAG changes do not appear:
 docker compose restart airflow-scheduler airflow-webserver
 ```
 
-## 5. Run The Main Historical DAG
+## 5. Optional JupyterLab
 
-The main DAG is:
+Start JupyterLab:
+
+```bash
+docker compose up jupyter
+```
+
+Open:
+
+```text
+http://localhost:8888
+```
+
+The project root is mounted at `/app` inside the Jupyter container.
+
+## 6. Run The Historical DAG
+
+The main DAG is named:
 
 ```text
 dag
 ```
 
-It processes the real historical source data from January 2023 to December 2024:
+It runs monthly from `2023-01-01` through `2024-12-01` with catchup enabled:
 
 ```text
-source data
+source CSVs
   -> bronze layer
   -> silver layer
   -> gold feature and label stores
@@ -141,26 +140,28 @@ source data
   -> monitoring-triggered retraining
 ```
 
-To trigger the main DAG from the terminal:
+Trigger it from the terminal:
 
 ```bash
 docker compose run --rm airflow-webserver airflow dags trigger dag
 ```
 
-Usually, you can also unpause `dag` in the Airflow UI and let catchup run all monthly periods.
+You can also unpause `dag` in the Airflow UI and let the historical catchup run.
 
-## 6. Main DAG Flow
+## 7. Main DAG Flow
 
-The DAG runs two data tracks before ML starts:
+The DAG first builds label and feature data tracks:
 
 ```text
 setup_directories
+  -> dep_check_source_label_data
   -> bronze_label_store
   -> silver_label_store
   -> gold_label_store
   -> label_store_completed
 
 setup_directories
+  -> dep_check_source_data_bronze_1
   -> bronze_feature_store
   -> silver_feature_store
   -> gold_feature_store
@@ -172,34 +173,32 @@ Then it runs the model lifecycle:
 ```text
 label_store_completed + feature_store_completed
   -> scheduled_training_start
-      -> scheduled_xgboost_training
-      -> skip_scheduled_xgboost_training
+      -> scheduled_xgboost_training OR skip_scheduled_xgboost_training
+      -> scheduled_log_reg_training OR skip_scheduled_log_reg_training
   -> scheduled_training_completed
   -> model_inference_start
-  -> model_xgboost_inference
+      -> model_xgboost_inference
+      -> model_log_reg_inference
   -> model_inference_completed
   -> model_monitor_start
-  -> model_1_monitor
+      -> model_xgboost_monitor
+      -> model_log_reg_monitor
   -> model_monitor_completed
   -> model_automl_start
-      -> model_xgboost_automl
-      -> skip_xgboost_retraining
+      -> model_xgboost_automl OR skip_xgboost_retraining
+      -> model_log_reg_automl OR skip_log_reg_retraining
   -> model_automl_completed
 ```
 
-Pink skipped tasks in Airflow are expected when a branch is not selected.
+Pink skipped tasks are expected when a branch is not selected.
 
-## 7. Bronze, Silver, And Gold Layers
-
-The medallion layers separate the data preparation lifecycle:
+## 8. Bronze, Silver, And Gold Layers
 
 ```text
-Bronze -> land monthly source data
+Bronze -> land monthly source data close to raw format
 Silver -> clean and standardize data
 Gold   -> create model-ready labels and features
 ```
-
-Bronze keeps monthly source extracts close to the raw format. Silver standardizes types, cleans invalid values, and prepares reliable inputs. Gold creates the final feature and label stores used by training, inference, monitoring, and simulation.
 
 Gold feature creation includes derived fields such as:
 
@@ -210,7 +209,13 @@ high_credit_utilization_flag
 Credit_History_Age_Months
 ```
 
-## 8. Model Training Setup
+The label maturity rule is:
+
+```text
+feature snapshot month M -> label month M + 6
+```
+
+## 9. Model Training
 
 Training starts from:
 
@@ -218,25 +223,64 @@ Training starts from:
 FIRST_TRAINING_DATE = 2024-09-01
 ```
 
-This is the earliest point where enough matured labels exist. The label maturity rule is:
+This is the first month with enough matured-label history. Scheduled training runs every 3 months after the latest training date recorded in `model_bank/model_log.csv`.
+
+Both model families are trained when scheduled training is due:
 
 ```text
-feature snapshot month M -> label month M + 6
+xgboost
+log_reg
 ```
 
-Scheduled model training runs every 3 months from the last training date. Training uses:
+Training uses:
 
 ```text
 12 months train/test window
 2 months out-of-time window
+25-iteration stochastic hyperparameter search
+numeric/categorical preprocessing with imputation
 sigmoid probability calibration
-threshold selection on validation/OOT metrics
+threshold selection by Youden's J on the validation split
 model registration in model_bank/model_log.csv
 ```
 
-## 9. Start Streamlit
+Model artifacts are saved as:
 
-Run the dashboard:
+```text
+model_bank/credit_model_<model_type>_YYYY_MM_DD_vN.pkl
+```
+
+The registry stores model type, train date, AUC/Gini/Brier/log-loss metrics, calibration details, threshold details, and champion/challenger flags.
+
+## 10. Inference, Monitoring, And Retraining
+
+Inference defaults to the champion model for each model type and writes only missing prediction months:
+
+```text
+datamart/gold/model_predictions/<model_version>/<model_version>_predictions_YYYY_MM_DD.parquet
+datamart/gold/model_predictions_csv/<model_version>/<model_version>_predictions_YYYY_MM_DD.csv
+```
+
+Monitoring compares the current feature snapshot against the selected model's training feature window:
+
+```text
+PSI -> model score drift
+CSI -> feature drift
+PSI >= 0.25 -> retrain_required
+CSI -> informational diagnostic signal
+```
+
+Monitoring outputs are written to:
+
+```text
+datamart/gold/model_monitoring/<model_version>/
+```
+
+If PSI requires retraining, the DAG branches to the matching model family's AutoML retraining task.
+
+## 11. Start Streamlit
+
+Run the dashboard from the repo root:
 
 ```bash
 streamlit run dashboard.py
@@ -248,16 +292,14 @@ Open:
 http://localhost:8501
 ```
 
-The dashboard is read-only. It does not train, infer, monitor, or evaluate by itself. It reads the files created by Airflow and the scripts.
+The dashboard is read-only. It reads files created by Airflow and the ML scripts; it does not trigger training, inference, monitoring, simulation, or evaluation.
 
-## 10. Setup Checklist
-
-Use this order for a clean setup:
+## 12. Clean Setup Checklist
 
 1. Start Airflow with Docker Compose.
 2. Open `http://localhost:8080`.
 3. Unpause or trigger the main `dag`.
-4. Let the historical backfill complete through December 2024.
-5. Confirm outputs exist under `datamart/gold/` and `model_bank/`.
-6. Start Streamlit with `streamlit run dashboard.py`.
-7. Use `Docs/02_simulation_pipeline.md` when you want to extend the pipeline with synthetic future data.
+4. Let the historical backfill complete through `2024-12-01`.
+5. Confirm `model_bank/model_log.csv` and prediction/monitoring outputs exist.
+6. Start Streamlit and review Monitoring, Predictions, and EDA.
+7. Run `simulation_inference_dag` if future synthetic months are needed.

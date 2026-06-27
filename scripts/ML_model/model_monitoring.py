@@ -316,6 +316,7 @@ def _write_outputs(
 def main(
     snapshotdate,
     modelname=None,
+    model_type=None,
     model_bank_directory=default_model_bank_directory,
     feature_store_directory=default_feature_store_directory,
     output_directory=default_output_directory,
@@ -327,7 +328,7 @@ def main(
     categorical_top_n=default_categorical_top_n,
 ):
     # Select champion by default, or use the explicitly requested model.
-    model_name = select_model_name(modelname, model_bank_directory)
+    model_name = select_model_name(modelname, model_bank_directory, model_type=model_type)
     model_version = os.path.splitext(model_name)[0]
     model_path = os.path.join(model_bank_directory, model_name)
 

@@ -12,6 +12,7 @@ import pandas as pd
 
 LOG_COLUMNS = [
     "model_version",
+    "model_type",
     "train_date",
     "auc_train",
     "auc_test",
@@ -102,6 +103,7 @@ def _row_from_artifact(path):
 
     return {
         "model_version": model_version,
+        "model_type": str(artifact.get("model_type", "")).strip(),
         "train_date": _train_date(artifact, model_version),
         "auc_train": auc_train,
         "auc_test": auc_test,

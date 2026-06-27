@@ -78,12 +78,26 @@ def unpredicted_gold_snapshot_dates(
     return [date for date in feature_dates if date not in predicted_dates]
 
 
-def select_model_name(modelname=None, model_bank_directory="model_bank/"):
+def select_model_name(modelname=None, model_bank_directory="model_bank/", model_type=None):
     """Return a validated model filename, defaulting to the champion model."""
     reconcile_model_log(model_bank_directory)
 
     if modelname:
         model_name = os.path.basename(str(modelname).strip())
+        if not model_name.endswith(".pkl"):
+            model_name += ".pkl"
+        model_path = os.path.join(model_bank_directory, model_name)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model artifact not found: {model_path}")
+
+        if model_type is not None:
+            with open(model_path, "rb") as file:
+                artifact = pickle.load(file)
+            if str(artifact.get("model_type", "")).strip() != model_type:
+                raise ValueError(
+                    f"Model artifact {model_name} is not of type {model_type}."
+                )
+
         selection_source = "user supplied"
     else:
         log_path = os.path.join(model_bank_directory, "model_log.csv")
@@ -91,7 +105,18 @@ def select_model_name(modelname=None, model_bank_directory="model_bank/"):
             raise FileNotFoundError(f"Model log not found: {log_path}")
 
         log_df = pd.read_csv(log_path)
-        champion_rows = log_df[log_df["champion"] == 1]
+        if model_type is not None:
+            filtered_rows = log_df[log_df["model_type"] == model_type]
+            if filtered_rows.empty:
+                raise ValueError(
+                    f"No model artifacts of type {model_type} found in model_log.csv"
+                )
+            champion_rows = filtered_rows[filtered_rows["champion"] == 1]
+            if champion_rows.empty:
+                champion_rows = filtered_rows
+        else:
+            champion_rows = log_df[log_df["champion"] == 1]
+
         if champion_rows.empty:
             raise ValueError("No champion model found in model_log.csv")
         if len(champion_rows) > 1:
@@ -116,10 +141,11 @@ def select_or_train_model_name(
     model_bank_directory="model_bank/",
     spark=None,
     bootstrap_train_date=BOOTSTRAP_MODEL_TRAIN_DATE,
+    model_type=None,
 ):
     """Return a model name, training one bootstrap champion when none exists."""
     try:
-        return select_model_name(modelname, model_bank_directory)
+        return select_model_name(modelname, model_bank_directory, model_type=model_type)
     except (FileNotFoundError, ValueError) as error:
         if modelname:
             raise
@@ -133,7 +159,10 @@ def select_or_train_model_name(
         summary = reconcile_model_log(model_bank_directory)
         if summary.get("champion"):
             print("Best available model selected as champion:", summary["champion"])
-            return select_model_name(None, model_bank_directory)
+            try:
+                return select_model_name(None, model_bank_directory, model_type=model_type)
+            except Exception:
+                pass
 
         print(
             "No valid model artifacts found in model bank. "
@@ -141,7 +170,7 @@ def select_or_train_model_name(
             f"Original issue: {error}"
         )
         try:
-            model_train.train_model(bootstrap_train_date, spark)
+            model_train.train_model(bootstrap_train_date, spark, model_type=model_type)
         except Exception as training_error:
             raise RuntimeError(
                 "No champion model is available, and bootstrap training could "
@@ -150,7 +179,7 @@ def select_or_train_model_name(
                 "inference."
             ) from training_error
 
-        return select_model_name(None, model_bank_directory)
+        return select_model_name(None, model_bank_directory, model_type=model_type)
 
 
 def main(
@@ -288,6 +317,7 @@ def run_new_gold_predictions(
     prediction_threshold=None,
     min_snapshotdate=None,
     max_snapshotdate=None,
+    model_type=None,
     model_bank_directory="model_bank/",
     feature_store_directory="datamart/gold/feature_store",
     prediction_directory="datamart/gold/model_predictions",
@@ -304,7 +334,12 @@ def run_new_gold_predictions(
     )
     spark.sparkContext.setLogLevel("ERROR")
     try:
-        model_name = select_or_train_model_name(modelname, model_bank_directory, spark)
+        model_name = select_or_train_model_name(
+            modelname,
+            model_bank_directory,
+            spark,
+            model_type=model_type,
+        )
     finally:
         spark.stop()
 
