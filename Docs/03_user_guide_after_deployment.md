@@ -117,6 +117,8 @@ simulation monitoring skipped because monitoring was disabled or no eligible sna
 simulation evaluation skipped because labels have not matured yet
 ```
 
+The simulation DAG has separate XGBoost and logistic-regression inference, monitoring, and evaluation branches. It is normal to see one branch family succeed or skip independently of the other.
+
 ## 6. Streamlit Dashboard Navigation
 
 The dashboard has three top-level pages:
@@ -263,7 +265,7 @@ xgboost
 log_reg
 ```
 
-Inference and monitoring are model-type aware in the historical DAG. When a specific `model_name` is supplied, it must match the expected model type for that task.
+Inference, monitoring, and performance evaluation are model-type aware in both the historical DAG and the simulation DAG. When a specific `model_name` is supplied, it must match the expected model type for that task.
 
 ## 9. Prediction Performance
 
@@ -352,6 +354,7 @@ synthetic gold feature partitions were not created
 max_snapshotdate is too early
 infer_through_latest_gold changed the effective upper bound
 no valid champion or requested model exists
+the supplied model_name does not match the model family branch
 ```
 
 ### Dashboard shows only one snapshot date

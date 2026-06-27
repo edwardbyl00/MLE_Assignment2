@@ -78,25 +78,29 @@ The DAG accepts these manual trigger parameters:
 generate_synthetic_gold_data
   -> check_simulation_gold_partitions
       -> run_simulation_xgboost_inference
+      -> run_simulation_log_reg_inference
       -> skip_simulation_xgboost_inference
+      -> skip_simulation_log_reg_inference
   -> simulation_inference_completed
   -> simulation_monitor_start
-  -> run_simulation_monitoring
+      -> run_simulation_xgboost_monitoring
+      -> run_simulation_log_reg_monitoring
   -> simulation_monitor_completed
   -> simulation_evaluation_start
-  -> evaluate_simulation_predictions
+      -> evaluate_simulation_xgboost_predictions
+      -> evaluate_simulation_log_reg_predictions
   -> simulation_evaluation_completed
 ```
 
-The task name says `xgboost` for historical compatibility, but the inference code can select a user-supplied model or default champion. In the main historical DAG, model-type-specific inference is run separately for XGBoost and logistic regression.
+The simulation DAG now runs model-type-specific branches for both XGBoost and logistic regression. The branch check uses the XGBoost champion to decide whether new gold partitions need scoring, then selects both model-family inference paths or both skip paths.
 
 What the simulation DAG does:
 
 1. Generates missing synthetic gold feature and label partitions.
-2. Checks which gold feature months do not already have predictions for the selected model version.
-3. Runs inference only for missing prediction months.
-4. Runs PSI/CSI monitoring for eligible synthetic feature snapshots.
-5. Evaluates predictions against labels once labels have matured.
+2. Checks which gold feature months do not already have XGBoost predictions.
+3. Runs XGBoost and logistic-regression inference only for missing prediction months.
+4. Runs PSI/CSI monitoring for both model families on eligible synthetic feature snapshots.
+5. Evaluates XGBoost and logistic-regression predictions against labels once labels have matured.
 
 ## 5. How Synthetic Data Is Generated
 
@@ -178,6 +182,8 @@ docker compose run --rm airflow-webserver airflow dags trigger simulation_infere
   --conf '{"model_name":"credit_model_xgboost_2024_09_01_v1.pkl"}'
 ```
 
+When supplying `model_name`, use an artifact that matches the model-family branch being run. A single manual trigger with a specific XGBoost artifact is not suitable for the logistic-regression branch, and vice versa.
+
 ## 7. Optional Manual Synthetic Generation
 
 The DAG is preferred because it runs generation, inference, monitoring, and evaluation together. To generate only synthetic gold partitions:
@@ -202,7 +208,7 @@ python scripts/utils/generate_synthetic_gold_data.py \
 
 ## 8. Monitoring Behavior
 
-By default, simulation monitoring runs for every eligible gold feature snapshot from `2024-09-01` through the selected synthetic horizon.
+By default, simulation monitoring runs for every eligible gold feature snapshot from `2024-09-01` through the selected synthetic horizon for both model families.
 
 Monitor one snapshot only:
 
@@ -240,6 +246,8 @@ Prediction performance is evaluated by:
 ```text
 scripts/ML_model/model_performance.py
 ```
+
+The simulation DAG passes `model_type` into the evaluator so XGBoost and logistic-regression outputs are evaluated separately.
 
 The maturity rule is:
 
@@ -281,6 +289,7 @@ synthetic gold feature partitions exist
 prediction files do not already exist for the selected model version
 max_snapshotdate is not earlier than the synthetic months
 model_bank/model_log.csv has a valid champion or the requested model exists
+the supplied model_name matches the model family being run
 ```
 
 If evaluation is skipped, check:

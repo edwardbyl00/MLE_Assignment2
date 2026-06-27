@@ -143,7 +143,7 @@ def check_simulation_gold_partitions(**context):
     try:
         os.chdir("/opt/airflow")
         try:
-            selected_model_name = model_inference.select_model_name(model_name)
+            selected_model_name = model_inference.select_model_name(model_name, model_type="xgboost")
         except (FileNotFoundError, ValueError) as error:
             # Continue to the inference task so it can bootstrap or reconcile a
             # champion model using the same logic as production inference.
@@ -152,7 +152,7 @@ def check_simulation_gold_partitions(**context):
                 "Continuing to inference so bootstrap training can run if possible. "
                 f"Original issue: {error}"
             )
-            return "run_simulation_xgboost_inference"
+            return ["run_simulation_xgboost_inference", "run_simulation_log_reg_inference"]
 
         model_version = os.path.splitext(selected_model_name)[0]
         snapshot_dates = model_inference.unpredicted_gold_snapshot_dates(
@@ -163,10 +163,10 @@ def check_simulation_gold_partitions(**context):
 
         if snapshot_dates:
             print("Synthetic gold partitions requiring inference:", snapshot_dates)
-            return "run_simulation_xgboost_inference"
+            return ["run_simulation_xgboost_inference", "run_simulation_log_reg_inference"]
 
         print("No synthetic gold partitions require inference.")
-        return "skip_simulation_xgboost_inference"
+        return ["skip_simulation_xgboost_inference", "skip_simulation_log_reg_inference"]
     finally:
         os.chdir(original_directory)
 
@@ -186,14 +186,38 @@ def run_simulation_xgboost_inference(**context):
             modelname=model_name,
             min_snapshotdate=FIRST_TRAINING_DATE,
             max_snapshotdate=max_snapshotdate,
+            model_type="xgboost",
         )
-        print("Simulation inference result:", result)
+        print("Simulation xgboost inference result:", result)
         return result
     finally:
         os.chdir(original_directory)
 
 
-def run_simulation_monitoring(**context):
+def run_simulation_log_reg_inference(**context):
+    import scripts.ML_model.model_inference as model_inference
+
+    model_name = dag_option(context, "model_name")
+    max_snapshotdate = dag_option(context, "max_snapshotdate")
+    if dag_option_bool(context, "infer_through_latest_gold", True):
+        max_snapshotdate = None
+
+    original_directory = os.getcwd()
+    try:
+        os.chdir("/opt/airflow")
+        result = model_inference.run_new_gold_predictions(
+            modelname=model_name,
+            min_snapshotdate=FIRST_TRAINING_DATE,
+            max_snapshotdate=max_snapshotdate,
+            model_type="log_reg",
+        )
+        print("Simulation log_reg inference result:", result)
+        return result
+    finally:
+        os.chdir(original_directory)
+
+
+def _run_simulation_monitoring(context, model_type):
     import scripts.ML_model.model_monitoring as model_monitoring
 
     if not dag_option_bool(context, "run_monitoring", True):
@@ -249,10 +273,11 @@ def run_simulation_monitoring(**context):
             result = model_monitoring.main(
                 snapshotdate=snapshot_date,
                 modelname=model_name,
+                model_type=model_type,
             )
             results.append(result)
 
-        print("Simulation monitoring results:", results)
+        print(f"Simulation {model_type} monitoring results:", results)
         return {
             "monitoring_count": len(results),
             "snapshot_dates": snapshot_dates,
@@ -262,7 +287,15 @@ def run_simulation_monitoring(**context):
         os.chdir(original_directory)
 
 
-def evaluate_simulation_predictions(**context):
+def run_simulation_xgboost_monitoring(**context):
+    return _run_simulation_monitoring(context, "xgboost")
+
+
+def run_simulation_log_reg_monitoring(**context):
+    return _run_simulation_monitoring(context, "log_reg")
+
+
+def _evaluate_simulation_predictions(context, model_type):
     import scripts.ML_model.model_performance as model_performance
 
     if not dag_option_bool(context, "evaluate_performance", True):
@@ -284,8 +317,9 @@ def evaluate_simulation_predictions(**context):
         result = model_performance.main(
             evaluationdate=evaluation_date,
             modelname=model_name,
+            model_type=model_type,
         )
-        print("Simulation performance evaluation result:", result)
+        print(f"Simulation {model_type} performance evaluation result:", result)
         return result
     except ValueError as error:
         # A simulation may create future predictions before enough labels have
@@ -293,6 +327,14 @@ def evaluate_simulation_predictions(**context):
         raise AirflowSkipException(str(error))
     finally:
         os.chdir(original_directory)
+
+
+def evaluate_simulation_xgboost_predictions(**context):
+    return _evaluate_simulation_predictions(context, "xgboost")
+
+
+def evaluate_simulation_log_reg_predictions(**context):
+    return _evaluate_simulation_predictions(context, "log_reg")
 
 
 default_args = {
@@ -341,13 +383,22 @@ with DAG(
         python_callable=check_simulation_gold_partitions,
     )
 
-    run_simulation_inference = PythonOperator(
+    run_xgboost_inference = PythonOperator(
         task_id="run_simulation_xgboost_inference",
         python_callable=run_simulation_xgboost_inference,
     )
 
-    skip_simulation_inference = DummyOperator(
+    run_log_reg_inference = PythonOperator(
+        task_id="run_simulation_log_reg_inference",
+        python_callable=run_simulation_log_reg_inference,
+    )
+
+    skip_xgboost_inference = DummyOperator(
         task_id="skip_simulation_xgboost_inference",
+    )
+
+    skip_log_reg_inference = DummyOperator(
+        task_id="skip_simulation_log_reg_inference",
     )
 
     simulation_inference_completed = DummyOperator(
@@ -359,32 +410,48 @@ with DAG(
         task_id="simulation_monitor_start",
     )
 
-    run_monitoring = PythonOperator(
-        task_id="run_simulation_monitoring",
-        python_callable=run_simulation_monitoring,
+    run_xgboost_monitoring = PythonOperator(
+        task_id="run_simulation_xgboost_monitoring",
+        python_callable=run_simulation_xgboost_monitoring,
+    )
+
+    run_log_reg_monitoring = PythonOperator(
+        task_id="run_simulation_log_reg_monitoring",
+        python_callable=run_simulation_log_reg_monitoring,
     )
 
     simulation_monitor_completed = DummyOperator(
         task_id="simulation_monitor_completed",
+        trigger_rule="none_failed_min_one_success",
     )
 
     simulation_evaluation_start = DummyOperator(
         task_id="simulation_evaluation_start",
     )
 
-    evaluate_predictions = PythonOperator(
-        task_id="evaluate_simulation_predictions",
-        python_callable=evaluate_simulation_predictions,
+    evaluate_xgboost_predictions = PythonOperator(
+        task_id="evaluate_simulation_xgboost_predictions",
+        python_callable=evaluate_simulation_xgboost_predictions,
+    )
+
+    evaluate_log_reg_predictions = PythonOperator(
+        task_id="evaluate_simulation_log_reg_predictions",
+        python_callable=evaluate_simulation_log_reg_predictions,
     )
 
     simulation_evaluation_completed = DummyOperator(
         task_id="simulation_evaluation_completed",
+        trigger_rule="none_failed_min_one_success",
     )
 
     generate_synthetic_gold >> check_simulation_gold
-    check_simulation_gold >> run_simulation_inference >> simulation_inference_completed
-    check_simulation_gold >> skip_simulation_inference >> simulation_inference_completed
+    check_simulation_gold >> run_xgboost_inference >> simulation_inference_completed
+    check_simulation_gold >> run_log_reg_inference >> simulation_inference_completed
+    check_simulation_gold >> skip_xgboost_inference >> simulation_inference_completed
+    check_simulation_gold >> skip_log_reg_inference >> simulation_inference_completed
     simulation_inference_completed >> simulation_monitor_start
-    simulation_monitor_start >> run_monitoring >> simulation_monitor_completed
+    simulation_monitor_start >> run_xgboost_monitoring >> simulation_monitor_completed
+    simulation_monitor_start >> run_log_reg_monitoring >> simulation_monitor_completed
     simulation_monitor_completed >> simulation_evaluation_start
-    simulation_evaluation_start >> evaluate_predictions >> simulation_evaluation_completed
+    simulation_evaluation_start >> evaluate_xgboost_predictions >> simulation_evaluation_completed
+    simulation_evaluation_start >> evaluate_log_reg_predictions >> simulation_evaluation_completed

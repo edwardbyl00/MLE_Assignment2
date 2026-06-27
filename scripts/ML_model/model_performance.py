@@ -314,6 +314,7 @@ def _write_outputs(output_directory, model_version, evaluation_date, summary, de
 def main(
     evaluationdate,
     modelname=None,
+    model_type=None,
     model_bank_directory=default_model_bank_directory,
     prediction_directory=default_prediction_directory,
     label_store_directory=default_label_store_directory,
@@ -321,7 +322,7 @@ def main(
     bins=default_bins,
 ):
     # Select champion by default, matching inference and monitoring behavior.
-    model_name = select_model_name(modelname, model_bank_directory)
+    model_name = select_model_name(modelname, model_bank_directory, model_type=model_type)
     model_version = os.path.splitext(model_name)[0]
     evaluation_date = pd.Timestamp(evaluationdate)
 
