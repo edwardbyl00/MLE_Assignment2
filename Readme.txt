@@ -1,9 +1,4 @@
-# Assignment 2: Monthly Credit-Risk ML Pipeline
-
-This project runs a monthly Apache Airflow pipeline for loan default prediction.
-It builds bronze, silver, and gold datamart layers, trains and versions XGBoost
-and logistic-regression models, runs inference and monitoring, evaluates
-predictions after labels mature, and displays outputs in Streamlit.
+Git Link: https://github.com/edwardbyl00/MLE_Assignment2.git
 
 ## Quick Start
 
