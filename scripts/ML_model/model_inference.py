@@ -106,24 +106,30 @@ def select_model_name(modelname=None, model_bank_directory="model_bank/", model_
 
         log_df = pd.read_csv(log_path)
         if model_type is not None:
-            filtered_rows = log_df[log_df["model_type"] == model_type]
-            if filtered_rows.empty:
+            pool = log_df[log_df["model_type"] == model_type]
+            if pool.empty:
                 raise ValueError(
                     f"No model artifacts of type {model_type} found in model_log.csv"
                 )
-            champion_rows = filtered_rows[filtered_rows["champion"] == 1]
-            if champion_rows.empty:
-                champion_rows = filtered_rows
         else:
-            champion_rows = log_df[log_df["champion"] == 1]
+            pool = log_df
 
-        if champion_rows.empty:
-            raise ValueError("No champion model found in model_log.csv")
+        champion_rows = pool[pool["champion"] == 1]
         if len(champion_rows) > 1:
             raise ValueError("More than one champion model found in model_log.csv")
 
-        model_name = str(champion_rows.iloc[0]["model_version"]).strip()
-        selection_source = "champion"
+        if not champion_rows.empty:
+            candidate_rows = champion_rows
+            selection_source = "champion"
+        else:
+            candidate_rows = pool[pool["challenger"] == 1]
+            if len(candidate_rows) > 1:
+                raise ValueError("More than one challenger model found in model_log.csv")
+            if candidate_rows.empty:
+                raise ValueError("No champion or challenger model found in model_log.csv")
+            selection_source = "challenger"
+
+        model_name = str(candidate_rows.iloc[0]["model_version"]).strip()
 
     if not model_name.endswith(".pkl"):
         model_name += ".pkl"
@@ -157,8 +163,8 @@ def select_or_train_model_name(
             "Checking model bank for the best available valid model."
         )
         summary = reconcile_model_log(model_bank_directory)
-        if summary.get("champion"):
-            print("Best available model selected as champion:", summary["champion"])
+        if summary.get("champions_by_type"):
+            print("Best available models selected as champions:", summary["champions_by_type"])
             try:
                 return select_model_name(None, model_bank_directory, model_type=model_type)
             except Exception:

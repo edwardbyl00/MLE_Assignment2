@@ -149,18 +149,15 @@ def reconcile_model_log(model_bank_directory="/opt/airflow/model_bank"):
             old_log = pd.DataFrame(columns=LOG_COLUMNS)
 
     old_versions = set()
-    old_champions = []
+    old_champions_by_type = {}
     if "model_version" in old_log.columns:
         old_versions = set(old_log["model_version"].dropna().astype(str).str.strip())
-    if {"model_version", "champion"}.issubset(old_log.columns):
-        champion_values = pd.to_numeric(old_log["champion"], errors="coerce").fillna(0)
-        old_champions = (
-            old_log.loc[champion_values.eq(1), "model_version"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .tolist()
-        )
+    if {"model_version", "model_type", "champion"}.issubset(old_log.columns):
+        champion_mask = pd.to_numeric(old_log["champion"], errors="coerce").fillna(0).eq(1)
+        for _, row in old_log[champion_mask].iterrows():
+            mtype = str(row["model_type"]).strip()
+            version = str(row["model_version"]).strip()
+            old_champions_by_type.setdefault(mtype, []).append(version)
 
     rows = []
     invalid_artifacts = {}
@@ -172,45 +169,45 @@ def reconcile_model_log(model_bank_directory="/opt/airflow/model_bank"):
 
     reconciled = pd.DataFrame(rows, columns=LOG_COLUMNS)
     valid_versions = set(reconciled["model_version"]) if not reconciled.empty else set()
-    valid_old_champions = [
-        version for version in dict.fromkeys(old_champions)
-        if version in valid_versions
-    ]
-
-    selected_champion = None
-    if len(valid_old_champions) == 1:
-        # Preserve the existing champion.
-        selected_champion = valid_old_champions[0]
-    elif not reconciled.empty:
-        # No champion exists — auto-promote the best model.
-        selected_champion = (
-            reconciled.sort_values(
-                ["auc_oot", "auc_test", "auc_train", "model_version"],
-                ascending=[False, False, False, True],
-            )
-            .iloc[0]["model_version"]
-        )
 
     reconciled["champion"] = 0
     reconciled["challenger"] = 0
-    if selected_champion:
-        reconciled["champion"] = (
-            reconciled["model_version"].eq(selected_champion).astype(int)
-        )
 
-    # Challenger: best non-champion by auc_oot; requires human to promote to champion.
-    non_champion = reconciled[reconciled["champion"] != 1]
-    if not non_champion.empty:
-        selected_challenger = (
-            non_champion.sort_values(
-                ["auc_oot", "auc_test", "auc_train", "model_version"],
-                ascending=[False, False, False, True],
+    # Per algo type: preserve existing champion if valid, else auto-promote best.
+    # Then assign challenger to the best non-champion within the same type.
+    champions_by_type = {}
+    challengers_by_type = {}
+    for model_type, group in reconciled.groupby("model_type"):
+        valid_old_champs = [
+            v for v in dict.fromkeys(old_champions_by_type.get(model_type, []))
+            if v in valid_versions
+        ]
+
+        if len(valid_old_champs) == 1:
+            selected_champion = valid_old_champs[0]
+        else:
+            selected_champion = (
+                group.sort_values(
+                    ["auc_oot", "auc_test", "auc_train", "model_version"],
+                    ascending=[False, False, False, True],
+                )
+                .iloc[0]["model_version"]
             )
-            .iloc[0]["model_version"]
-        )
-        reconciled["challenger"] = (
-            reconciled["model_version"].eq(selected_challenger).astype(int)
-        )
+
+        reconciled.loc[reconciled["model_version"].eq(selected_champion), "champion"] = 1
+        champions_by_type[model_type] = selected_champion
+
+        non_champion = group[group["model_version"] != selected_champion]
+        if not non_champion.empty:
+            selected_challenger = (
+                non_champion.sort_values(
+                    ["auc_oot", "auc_test", "auc_train", "model_version"],
+                    ascending=[False, False, False, True],
+                )
+                .iloc[0]["model_version"]
+            )
+            reconciled.loc[reconciled["model_version"].eq(selected_challenger), "challenger"] = 1
+            challengers_by_type[model_type] = selected_challenger
 
     reconciled = reconciled.sort_values("model_version").reset_index(drop=True)
     fd, temporary_path = tempfile.mkstemp(
@@ -224,26 +221,22 @@ def reconcile_model_log(model_bank_directory="/opt/airflow/model_bank"):
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
 
-    selected_challenger = None
-    challenger_rows = reconciled[reconciled["challenger"] == 1]
-    if not challenger_rows.empty:
-        selected_challenger = challenger_rows.iloc[0]["model_version"]
-
     summary = {
         "log_path": log_path,
         "valid_models": len(reconciled),
         "added": sorted(valid_versions - old_versions),
         "removed": sorted(old_versions - valid_versions),
         "invalid_artifacts": invalid_artifacts,
-        "champion": selected_champion,
-        "challenger": selected_challenger,
+        "champions_by_type": champions_by_type,
+        "challengers_by_type": challengers_by_type,
     }
     print(
         "model log reconciled:",
-        f"{summary['valid_models']} valid model(s),",
-        f"champion={summary['champion']},",
-        f"challenger={summary['challenger']}",
+        f"{summary['valid_models']} valid model(s)",
     )
+    for mtype, champion in champions_by_type.items():
+        challenger = challengers_by_type.get(mtype)
+        print(f"  {mtype}: champion={champion}, challenger={challenger}")
     if summary["added"]:
         print("added:", ", ".join(summary["added"]))
     if summary["removed"]:
