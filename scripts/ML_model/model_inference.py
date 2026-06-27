@@ -78,7 +78,7 @@ def unpredicted_gold_snapshot_dates(
     return [date for date in feature_dates if date not in predicted_dates]
 
 
-def select_model_name(modelname=None, model_bank_directory="model_bank/", model_type=None):
+def select_model_name(modelname=None, model_bank_directory="model_bank/"):
     """Return a validated model filename, defaulting to the champion model."""
     reconcile_model_log(model_bank_directory)
 
@@ -91,27 +91,14 @@ def select_model_name(modelname=None, model_bank_directory="model_bank/", model_
             raise FileNotFoundError(f"Model log not found: {log_path}")
 
         log_df = pd.read_csv(log_path)
-        if model_type:
-            if "model_type" not in log_df.columns:
-                raise ValueError("model_log.csv has no model_type column")
-            model_rows = log_df[log_df["model_type"].eq(model_type)].copy()
-            if model_rows.empty:
-                raise ValueError(f"No {model_type} model found in model_log.csv")
-            model_rows = model_rows.sort_values(
-                ["auc_oot", "auc_test", "auc_train", "model_version"],
-                ascending=[False, False, False, True],
-            )
-            model_name = str(model_rows.iloc[0]["model_version"]).strip()
-            selection_source = model_type
-        else:
-            champion_rows = log_df[log_df["champion"] == 1]
-            if champion_rows.empty:
-                raise ValueError("No champion model found in model_log.csv")
-            if len(champion_rows) > 1:
-                raise ValueError("More than one champion model found in model_log.csv")
+        champion_rows = log_df[log_df["champion"] == 1]
+        if champion_rows.empty:
+            raise ValueError("No champion model found in model_log.csv")
+        if len(champion_rows) > 1:
+            raise ValueError("More than one champion model found in model_log.csv")
 
-            model_name = str(champion_rows.iloc[0]["model_version"]).strip()
-            selection_source = "champion"
+        model_name = str(champion_rows.iloc[0]["model_version"]).strip()
+        selection_source = "champion"
 
     if not model_name.endswith(".pkl"):
         model_name += ".pkl"
@@ -129,11 +116,10 @@ def select_or_train_model_name(
     model_bank_directory="model_bank/",
     spark=None,
     bootstrap_train_date=BOOTSTRAP_MODEL_TRAIN_DATE,
-    model_type=None,
 ):
     """Return a model name, training one bootstrap champion when none exists."""
     try:
-        return select_model_name(modelname, model_bank_directory, model_type)
+        return select_model_name(modelname, model_bank_directory)
     except (FileNotFoundError, ValueError) as error:
         if modelname:
             raise
@@ -145,9 +131,9 @@ def select_or_train_model_name(
             "Checking model bank for the best available valid model."
         )
         summary = reconcile_model_log(model_bank_directory)
-        if summary.get("champion") and model_type is None:
+        if summary.get("champion"):
             print("Best available model selected as champion:", summary["champion"])
-            return select_model_name(None, model_bank_directory, model_type)
+            return select_model_name(None, model_bank_directory)
 
         print(
             "No valid model artifacts found in model bank. "
@@ -155,11 +141,7 @@ def select_or_train_model_name(
             f"Original issue: {error}"
         )
         try:
-            model_train.train_model(
-                bootstrap_train_date,
-                spark,
-                model_type=model_type or "xgboost",
-            )
+            model_train.train_model(bootstrap_train_date, spark)
         except Exception as training_error:
             raise RuntimeError(
                 "No champion model is available, and bootstrap training could "
@@ -168,14 +150,13 @@ def select_or_train_model_name(
                 "inference."
             ) from training_error
 
-        return select_model_name(None, model_bank_directory, model_type)
+        return select_model_name(None, model_bank_directory)
 
 
 def main(
     snapshotdate,
     modelname=None,
     prediction_threshold=None,
-    model_type=None,
 ):
     """Score one gold feature-store snapshot with the selected model artifact."""
     print("\n\n---starting job---\n\n")
@@ -190,12 +171,7 @@ def main(
 
     try:
         model_bank_directory = "model_bank/"
-        model_name = select_or_train_model_name(
-            modelname,
-            model_bank_directory,
-            spark,
-            model_type=model_type,
-        )
+        model_name = select_or_train_model_name(modelname, model_bank_directory, spark)
 
         config = {
             "snapshot_date_str": snapshotdate,
@@ -312,7 +288,6 @@ def run_new_gold_predictions(
     prediction_threshold=None,
     min_snapshotdate=None,
     max_snapshotdate=None,
-    model_type=None,
     model_bank_directory="model_bank/",
     feature_store_directory="datamart/gold/feature_store",
     prediction_directory="datamart/gold/model_predictions",
@@ -329,12 +304,7 @@ def run_new_gold_predictions(
     )
     spark.sparkContext.setLogLevel("ERROR")
     try:
-        model_name = select_or_train_model_name(
-            modelname,
-            model_bank_directory,
-            spark,
-            model_type=model_type,
-        )
+        model_name = select_or_train_model_name(modelname, model_bank_directory, spark)
     finally:
         spark.stop()
 
@@ -363,7 +333,7 @@ def run_new_gold_predictions(
 
     for snapshot_date in snapshot_dates:
         print(f"Running inference for new gold snapshot {snapshot_date}")
-        main(snapshot_date, model_name, prediction_threshold, model_type)
+        main(snapshot_date, model_name, prediction_threshold)
 
     return {
         "model_name": model_name,
@@ -382,12 +352,6 @@ if __name__ == "__main__":
         required=False,
         default=None,
         help="Optional model filename/version; defaults to the champion model",
-    )
-    parser.add_argument(
-        "--model-type",
-        default=None,
-        choices=["xgboost", "logistic_regression"],
-        help="Optional model algorithm filter.",
     )
     parser.add_argument(
         "--prediction-threshold",
@@ -418,12 +382,6 @@ if __name__ == "__main__":
             prediction_threshold=args.prediction_threshold,
             min_snapshotdate=args.min_snapshotdate,
             max_snapshotdate=args.max_snapshotdate or args.snapshotdate,
-            model_type=args.model_type,
         )
     else:
-        main(
-            args.snapshotdate,
-            args.modelname,
-            args.prediction_threshold,
-            args.model_type,
-        )
+        main(args.snapshotdate, args.modelname, args.prediction_threshold)

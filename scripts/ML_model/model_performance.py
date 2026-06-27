@@ -314,7 +314,6 @@ def _write_outputs(output_directory, model_version, evaluation_date, summary, de
 def main(
     evaluationdate,
     modelname=None,
-    model_type=None,
     model_bank_directory=default_model_bank_directory,
     prediction_directory=default_prediction_directory,
     label_store_directory=default_label_store_directory,
@@ -322,7 +321,7 @@ def main(
     bins=default_bins,
 ):
     # Select champion by default, matching inference and monitoring behavior.
-    model_name = select_model_name(modelname, model_bank_directory, model_type)
+    model_name = select_model_name(modelname, model_bank_directory)
     model_version = os.path.splitext(model_name)[0]
     evaluation_date = pd.Timestamp(evaluationdate)
 
@@ -409,12 +408,6 @@ if __name__ == "__main__":
         default=None,
         help="Optional model filename/version. Defaults to champion model.",
     )
-    parser.add_argument(
-        "--model-type",
-        default=None,
-        choices=["xgboost", "logistic_regression"],
-        help="Optional model algorithm filter.",
-    )
     parser.add_argument("--model-bank", default=default_model_bank_directory)
     parser.add_argument("--prediction-dir", default=default_prediction_directory)
     parser.add_argument("--label-store", default=default_label_store_directory)
@@ -425,7 +418,6 @@ if __name__ == "__main__":
     main(
         evaluationdate=args.evaluationdate,
         modelname=args.modelname,
-        model_type=args.model_type,
         model_bank_directory=args.model_bank,
         prediction_directory=args.prediction_dir,
         label_store_directory=args.label_store,

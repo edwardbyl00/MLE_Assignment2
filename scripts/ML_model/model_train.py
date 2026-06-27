@@ -17,7 +17,6 @@ from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import ParameterSampler, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.linear_model import LogisticRegression
 
 try:
     from sklearn.frozen import FrozenEstimator
@@ -35,53 +34,6 @@ except ModuleNotFoundError:
 # Threshold selection is separated from probability calibration. Calibration
 # makes the score more probability-like; this metric chooses the binary cutoff.
 THRESHOLD_SELECTION_METRIC = "youden_j"
-
-MODEL_CONFIGS = {
-    "xgboost": {
-        "version_prefix": "credit_model",
-        "search_iterations": 25,
-        "param_dist": {
-            "n_estimators": [25, 30, 35],
-            "max_depth": [2, 4, 6],
-            "learning_rate": [0.01, 0.1],
-            "subsample": [0.6, 0.8],
-            "colsample_bytree": [0.6, 0.8],
-            "gamma": [0, 0.1],
-            "min_child_weight": [1, 3, 5],
-            "reg_alpha": [0, 0.1, 1],
-            "reg_lambda": [1, 1.5, 2],
-        },
-    },
-    "logistic_regression": {
-        "version_prefix": "credit_model_log_reg",
-        "search_iterations": 8,
-        "param_dist": {
-            "C": [0.01, 0.1, 1.0, 10.0],
-            "class_weight": [None, "balanced"],
-            "penalty": ["l2"],
-            "solver": ["lbfgs"],
-            "max_iter": [1000],
-        },
-    },
-}
-
-
-def _build_candidate_model(model_type, params):
-    if model_type == "xgboost":
-        return xgb.XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="auc",
-            random_state=88,
-            n_jobs=-1,
-            **params,
-        )
-    if model_type == "logistic_regression":
-        return LogisticRegression(
-            random_state=88,
-            n_jobs=-1,
-            **params,
-        )
-    raise ValueError(f"Unsupported model_type: {model_type}")
 
 
 def _fit_prefit_calibrator(model, method, x_values, y_values):
@@ -175,26 +127,18 @@ def _select_prediction_threshold(y_true, probabilities):
     return selected_result, threshold_results
 
 
-def train_model(date_str, spark, model_type="xgboost"):
+def train_model(date_str, spark):
     """Train, evaluate, save, and register a versioned credit-risk model."""
-    if model_type not in MODEL_CONFIGS:
-        raise ValueError(
-            f"Unsupported model_type '{model_type}'. "
-            f"Expected one of: {sorted(MODEL_CONFIGS)}"
-        )
-
-    model_config = MODEL_CONFIGS[model_type]
     # The label is observed after a 6-month MOB window, so training joins each
     # label month back to features from six months earlier.
     train_test_period_months = 12
     oot_period_months = 2
     train_test_ratio = 0.8
-    stochastic_search_iterations = model_config["search_iterations"]
+    stochastic_search_iterations = 25
     label_mob_months = 6
 
     config = {
         "model_train_date_str": date_str,
-        "model_type": model_type,
         "train_test_period_months": train_test_period_months,
         "oot_period_months": oot_period_months,
         "label_mob_months": label_mob_months,
@@ -340,26 +284,44 @@ def train_model(date_str, spark, model_type="xgboost"):
     X_test_processed = fitted_preprocessor.transform(X_test)
     X_oot_processed = fitted_preprocessor.transform(X_oot)
 
+    param_dist = {
+        "n_estimators": [25, 30, 35],
+        "max_depth": [2, 4, 6],
+        "learning_rate": [0.01, 0.1],
+        "subsample": [0.6, 0.8],
+        "colsample_bytree": [0.6, 0.8],
+        "gamma": [0, 0.1],
+        "min_child_weight": [1, 3, 5],
+        "reg_alpha": [0, 0.1, 1],
+        "reg_lambda": [1, 1.5, 2],
+    }
+
     best_model = None
     best_params = None
     best_search_auc = -1.0
     sampled_params = list(
         ParameterSampler(
-            model_config["param_dist"],
+            param_dist,
             n_iter=stochastic_search_iterations,
             random_state=88,
         )
     )
     for index, params in enumerate(sampled_params, start=1):
         # Use a bounded random search to keep DAG runtime predictable.
-        candidate_model = _build_candidate_model(model_type, params)
+        candidate_model = xgb.XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="auc",
+            random_state=88,
+            n_jobs=-1,
+            **params,
+        )
         candidate_model.fit(X_train_processed, y_train)
         candidate_auc = roc_auc_score(
             y_test,
             candidate_model.predict_proba(X_test_processed)[:, 1],
         )
         print(
-            f"{model_type} stochastic search {index}/{len(sampled_params)} "
+            f"Stochastic search {index}/{len(sampled_params)} "
             f"TEST AUC={candidate_auc:.4f} params={params}"
         )
         if candidate_auc > best_search_auc:
@@ -434,7 +396,7 @@ def train_model(date_str, spark, model_type="xgboost"):
     print(f"OOT    AUC={oot_auc_score:.4f}  GINI={round(2 * oot_auc_score - 1, 3)}")
 
     model_bank_directory = ensure_directory("/opt/airflow/model_bank/")
-    base_version = model_config["version_prefix"] + "_" + date_str.replace("-", "_")
+    base_version = "credit_model_" + date_str.replace("-", "_")
     existing_versions = glob.glob(
         os.path.join(model_bank_directory, base_version + "_v*.pkl")
     )
@@ -445,7 +407,6 @@ def train_model(date_str, spark, model_type="xgboost"):
         # model for diagnostics or future comparison.
         "model": final_model,
         "base_model": best_model,
-        "model_type": model_type,
         "model_version": model_version,
         "preprocessing_transformers": {"preprocessor": fitted_preprocessor},
         "data_dates": config,
@@ -500,7 +461,6 @@ def train_model(date_str, spark, model_type="xgboost"):
     log_path = os.path.join(model_bank_directory, "model_log.csv")
     new_row = {
         "model_version": model_version,
-        "model_type": model_type,
         "train_date": date_str,
         "auc_train": train_auc_score,
         "auc_test": test_auc_score,

@@ -316,7 +316,6 @@ def _write_outputs(
 def main(
     snapshotdate,
     modelname=None,
-    model_type=None,
     model_bank_directory=default_model_bank_directory,
     feature_store_directory=default_feature_store_directory,
     output_directory=default_output_directory,
@@ -328,7 +327,7 @@ def main(
     categorical_top_n=default_categorical_top_n,
 ):
     # Select champion by default, or use the explicitly requested model.
-    model_name = select_model_name(modelname, model_bank_directory, model_type)
+    model_name = select_model_name(modelname, model_bank_directory)
     model_version = os.path.splitext(model_name)[0]
     model_path = os.path.join(model_bank_directory, model_name)
 
@@ -453,12 +452,6 @@ if __name__ == "__main__":
         default=None,
         help="Optional model filename/version. Defaults to champion model.",
     )
-    parser.add_argument(
-        "--model-type",
-        default=None,
-        choices=["xgboost", "logistic_regression"],
-        help="Optional model algorithm filter.",
-    )
     parser.add_argument("--model-bank", default=default_model_bank_directory)
     parser.add_argument(
         "--feature-store",
@@ -503,7 +496,6 @@ if __name__ == "__main__":
     main(
         snapshotdate=args.snapshotdate,
         modelname=args.modelname,
-        model_type=args.model_type,
         model_bank_directory=args.model_bank,
         feature_store_directory=args.feature_store,
         output_directory=args.output_dir,

@@ -16,7 +16,6 @@ sys.path.insert(0, '/opt/airflow')
 import scripts.utils.data_processing_bronze_table as bronze
 import scripts.utils.data_processing_silver_table as silver
 import scripts.utils.data_processing_gold_table as gold
-from scripts.utils.dag_utils import dag_option, dag_option_bool
 
 # Directory path setup. These are container paths because Airflow runs inside
 # Docker with repo folders mounted under /opt/airflow.
@@ -58,6 +57,26 @@ all_dir = [
     silver_loan_daily_directory, silver_feature_directory,
     gold_label_store_directory, gold_feature_store_directory,
 ]
+
+
+def dag_option(context, key, default=None):
+    """Read manual trigger config first, then DAG params, normalizing blanks."""
+    dag_run = context.get("dag_run")
+    if dag_run and dag_run.conf and key in dag_run.conf:
+        value = dag_run.conf.get(key)
+    else:
+        value = (context.get("params") or {}).get(key, default)
+
+    if value == "":
+        return default
+    return value
+
+
+def dag_option_bool(context, key, default=False):
+    value = dag_option(context, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def get_spark():
@@ -263,28 +282,7 @@ def task_xgboost_train(**context):
 
     spark = get_spark()
     try:
-        model_train.train_model(date_str, spark, model_type="xgboost")
-    finally:
-        spark.stop()
-
-
-def task_log_reg_train(**context):
-    import scripts.ML_model.model_train as model_train
-
-    date_str = context["execution_date"].strftime("%Y-%m-%d")
-
-    if date_str < FIRST_TRAINING_DATE:
-        raise AirflowSkipException(
-            f"Skipping training for {date_str}: insufficient matured label history. "
-            f"Earliest eligible training date is {FIRST_TRAINING_DATE}."
-        )
-
-    training_data_end_date = previous_month_start(date_str)
-    validate_gold_medallion_range(BACKFILL_START_DATE, training_data_end_date)
-
-    spark = get_spark()
-    try:
-        model_train.train_model(date_str, spark, model_type="logistic_regression")
+        model_train.train_model(date_str, spark)
     finally:
         spark.stop()
 
@@ -298,23 +296,23 @@ def task_branch_training_interval(**context):
             f"Skipping scheduled training for {date_str}. Earliest training date "
             f"is {FIRST_TRAINING_DATE}."
         )
-        return "skip_scheduled_model_training"
+        return "skip_scheduled_xgboost_training"
 
     log_path = "/opt/airflow/model_bank/model_log.csv"
     if not os.path.exists(log_path):
         # First eligible run: no registry exists yet, so create the first model.
         print("No model_log.csv found. Running first scheduled training.")
-        return ["scheduled_xgboost_training", "scheduled_log_reg_training"]
+        return "scheduled_xgboost_training"
 
     log_df = pd.read_csv(log_path)
     if "train_date" not in log_df.columns or log_df.empty:
         print("No prior train_date found in model_log.csv. Running training.")
-        return ["scheduled_xgboost_training", "scheduled_log_reg_training"]
+        return "scheduled_xgboost_training"
 
     train_dates = pd.to_datetime(log_df["train_date"], errors="coerce").dropna()
     if train_dates.empty:
         print("No valid prior train_date found. Running training.")
-        return ["scheduled_xgboost_training", "scheduled_log_reg_training"]
+        return "scheduled_xgboost_training"
 
     last_train_date = train_dates.max().strftime("%Y-%m-%d")
     months_since_last_train = month_difference(last_train_date, date_str)
@@ -325,28 +323,17 @@ def task_branch_training_interval(**context):
             f"Last training was {last_train_date}; {months_since_last_train} "
             f"month(s) elapsed. Running scheduled training."
         )
-        return ["scheduled_xgboost_training", "scheduled_log_reg_training"]
+        return "scheduled_xgboost_training"
 
     print(
         f"Last training was {last_train_date}; only {months_since_last_train} "
         f"month(s) elapsed. Next scheduled training is after "
         f"{TRAINING_INTERVAL_MONTHS} months."
     )
-    return "skip_scheduled_model_training"
+    return "skip_scheduled_xgboost_training"
 
 
-def model_name_option(context, model_type, default=None):
-    key_by_type = {
-        "xgboost": "xgboost_model_name",
-        "logistic_regression": "log_reg_model_name",
-    }
-    specific_model_name = dag_option(context, key_by_type[model_type], None)
-    if specific_model_name:
-        return specific_model_name
-    return dag_option(context, "model_name", default)
-
-
-def task_infer_model(model_type, model_name=None, **context):
+def task_infer_xgb(model_name=None, **context):
     import scripts.ML_model.model_inference as model_inference
 
     date_str = context["execution_date"].strftime("%Y-%m-%d")
@@ -356,9 +343,9 @@ def task_infer_model(model_type, model_name=None, **context):
             f"{FIRST_TRAINING_DATE}."
         )
 
-    # Forward optional manual overrides. Each path defaults to its model type.
+    # Forward optional manual overrides. model_inference defaults to the champion.
     max_snapshotdate = date_str
-    model_name = model_name_option(context, model_type, model_name)
+    model_name = dag_option(context, "model_name", model_name)
     max_snapshotdate = dag_option(context, "max_snapshotdate", max_snapshotdate)
     if dag_option_bool(context, "infer_through_latest_gold", False):
         max_snapshotdate = None
@@ -371,7 +358,6 @@ def task_infer_model(model_type, model_name=None, **context):
             modelname=model_name,
             min_snapshotdate=FIRST_TRAINING_DATE,
             max_snapshotdate=max_snapshotdate,
-            model_type=model_type,
         )
         print("Inference volume-trigger result:", result)
         return result
@@ -379,15 +365,7 @@ def task_infer_model(model_type, model_name=None, **context):
         os.chdir(original_directory)
 
 
-def task_infer_xgb(model_name=None, **context):
-    return task_infer_model("xgboost", model_name, **context)
-
-
-def task_infer_log_reg(model_name=None, **context):
-    return task_infer_model("logistic_regression", model_name, **context)
-
-
-def task_monitor_model(model_type, model_name=None, **context):
+def task_monitor_xgb(model_name=None, **context):
     import scripts.ML_model.model_monitoring as model_monitoring
 
     date_str = context["execution_date"].strftime("%Y-%m-%d")
@@ -397,22 +375,16 @@ def task_monitor_model(model_type, model_name=None, **context):
             f"date is {FIRST_TRAINING_DATE}."
         )
 
-    model_name = model_name_option(context, model_type, model_name)
+    dag_run = context.get("dag_run")
+    if dag_run and dag_run.conf:
+        model_name = dag_run.conf.get("model_name", model_name)
 
     try:
-        return model_monitoring.main(date_str, model_name, model_type=model_type)
+        return model_monitoring.main(date_str, model_name)
     except FileNotFoundError as error:
         if "Missing model monitoring reference feature-store partitions" in str(error):
             raise AirflowSkipException(str(error))
         raise
-
-
-def task_monitor_xgb(model_name=None, **context):
-    return task_monitor_model("xgboost", model_name, **context)
-
-
-def task_monitor_log_reg(model_name=None, **context):
-    return task_monitor_model("logistic_regression", model_name, **context)
 
 
 def task_branch_retraining(**context):
@@ -421,14 +393,7 @@ def task_branch_retraining(**context):
 
     task_instance = context["ti"]
     date_str = context["execution_date"].strftime("%Y-%m-%d")
-    monitoring_summaries = [
-        task_instance.xcom_pull(task_ids="model_xgboost_monitor"),
-        task_instance.xcom_pull(task_ids="model_log_reg_monitor"),
-    ]
-    monitoring_summary = next(
-        (s for s in monitoring_summaries if s and s.get("retrain_required")),
-        next((s for s in monitoring_summaries if s), None),
-    )
+    monitoring_summary = task_instance.xcom_pull(task_ids="model_1_monitor")
 
     if not monitoring_summary:
         # If XCom is unavailable after a retry or UI-triggered rerun, recover
@@ -453,11 +418,11 @@ def task_branch_retraining(**context):
                 monitoring_summary = matching_rows.iloc[-1].to_dict()
 
     if monitoring_summary and monitoring_summary.get("retrain_required"):
-        print("Monitoring requested retraining:", monitoring_summaries)
-        return ["model_xgboost_automl", "model_log_reg_automl"]
+        print("Monitoring requested retraining:", monitoring_summary)
+        return "model_xgboost_automl"
 
     print("Monitoring did not request retraining:", monitoring_summary)
-    return "skip_model_retraining"
+    return "skip_xgboost_retraining"
 
 
 # DAG definition
@@ -551,12 +516,8 @@ with DAG(
         task_id="scheduled_xgboost_training",
         python_callable=task_xgboost_train,
     )
-    scheduled_log_reg_training = PythonOperator(
-        task_id="scheduled_log_reg_training",
-        python_callable=task_log_reg_train,
-    )
-    skip_scheduled_model_training = DummyOperator(
-        task_id="skip_scheduled_model_training",
+    skip_scheduled_xgboost_training = DummyOperator(
+        task_id="skip_scheduled_xgboost_training",
     )
     scheduled_training_completed = DummyOperator(
         task_id="scheduled_training_completed",
@@ -564,8 +525,7 @@ with DAG(
     )
 
     scheduled_training_start >> scheduled_xgboost_training >> scheduled_training_completed
-    scheduled_training_start >> scheduled_log_reg_training >> scheduled_training_completed
-    scheduled_training_start >> skip_scheduled_model_training >> scheduled_training_completed
+    scheduled_training_start >> skip_scheduled_xgboost_training >> scheduled_training_completed
 
 
     # model inference
@@ -574,34 +534,28 @@ with DAG(
         task_id="model_xgboost_inference",
         python_callable=task_infer_xgb,
     )
-    model_log_reg_inference = PythonOperator(
-        task_id="model_log_reg_inference",
-        python_callable=task_infer_log_reg,
-    )
+    model_2_inference = DummyOperator(task_id="model_2_inference")
     model_inference_completed = DummyOperator(task_id="model_inference_completed")
 
     model_inference_start >> model_xgboost_inference >> model_inference_completed
-    model_inference_start >> model_log_reg_inference >> model_inference_completed
+    model_inference_start >> model_2_inference >> model_inference_completed
 
 
     # model monitoring
     model_monitor_start = DummyOperator(task_id="model_monitor_start")
-    model_xgboost_monitor = PythonOperator(
-        task_id="model_xgboost_monitor",
+    model_1_monitor = PythonOperator(
+        task_id="model_1_monitor",
         python_callable=task_monitor_xgb,
     )
-    model_log_reg_monitor = PythonOperator(
-        task_id="model_log_reg_monitor",
-        python_callable=task_monitor_log_reg,
-    )
+    model_2_monitor = DummyOperator(task_id="model_2_monitor")
     model_monitor_completed = DummyOperator(
         task_id="model_monitor_completed",
         trigger_rule="none_failed_min_one_success",
     )
 
     model_inference_completed >> model_monitor_start
-    model_monitor_start >> model_xgboost_monitor >> model_monitor_completed
-    model_monitor_start >> model_log_reg_monitor >> model_monitor_completed
+    model_monitor_start >> model_1_monitor >> model_monitor_completed
+    model_monitor_start >> model_2_monitor >> model_monitor_completed
 
 
     # model training
@@ -613,11 +567,8 @@ with DAG(
         task_id="model_xgboost_automl",
         python_callable=task_xgboost_train,
     )
-    model_log_reg_automl = PythonOperator(
-        task_id="model_log_reg_automl",
-        python_callable=task_log_reg_train,
-    )
-    skip_model_retraining = DummyOperator(task_id="skip_model_retraining")
+    skip_xgboost_retraining = DummyOperator(task_id="skip_xgboost_retraining")
+    model_2_automl = DummyOperator(task_id="model_2_automl")
     model_automl_completed = DummyOperator(
         task_id="model_automl_completed",
         trigger_rule="none_failed_min_one_success",
@@ -628,5 +579,5 @@ with DAG(
     scheduled_training_completed >> model_inference_start
     model_monitor_completed >> model_automl_start
     model_automl_start >> model_xgboost_automl >> model_automl_completed
-    model_automl_start >> model_log_reg_automl >> model_automl_completed
-    model_automl_start >> skip_model_retraining >> model_automl_completed
+    model_automl_start >> skip_xgboost_retraining >> model_automl_completed
+    model_automl_start >> model_2_automl >> model_automl_completed

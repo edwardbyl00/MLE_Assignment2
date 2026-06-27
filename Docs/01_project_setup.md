@@ -173,21 +173,17 @@ Then it runs the model lifecycle:
 label_store_completed + feature_store_completed
   -> scheduled_training_start
       -> scheduled_xgboost_training
-      -> scheduled_log_reg_training
-      -> skip_scheduled_model_training
+      -> skip_scheduled_xgboost_training
   -> scheduled_training_completed
   -> model_inference_start
   -> model_xgboost_inference
-  -> model_log_reg_inference
   -> model_inference_completed
   -> model_monitor_start
-  -> model_xgboost_monitor
-  -> model_log_reg_monitor
+  -> model_1_monitor
   -> model_monitor_completed
   -> model_automl_start
       -> model_xgboost_automl
-      -> model_log_reg_automl
-      -> skip_model_retraining
+      -> skip_xgboost_retraining
   -> model_automl_completed
 ```
 

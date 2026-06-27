@@ -12,9 +12,41 @@ from airflow.operators.python import BranchPythonOperator, PythonOperator
 
 sys.path.insert(0, "/opt/airflow")
 
-from scripts.utils.dag_utils import dag_option, dag_option_bool, dag_option_int, dag_option_float
-
 FIRST_TRAINING_DATE = "2024-09-01"
+
+
+def dag_option(context, key, default=None):
+    """Read manual trigger config first, then DAG params, normalizing blanks."""
+    dag_run = context.get("dag_run")
+    if dag_run and dag_run.conf and key in dag_run.conf:
+        value = dag_run.conf.get(key)
+    else:
+        value = (context.get("params") or {}).get(key, default)
+
+    if value == "":
+        return default
+    return value
+
+
+def dag_option_bool(context, key, default=False):
+    value = dag_option(context, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def dag_option_int(context, key, default):
+    value = dag_option(context, key, default)
+    if value is None:
+        return default
+    return int(value)
+
+
+def dag_option_float(context, key, default):
+    value = dag_option(context, key, default)
+    if value is None:
+        return default
+    return float(value)
 
 
 def latest_gold_snapshot_date(gold_store_directory, dataset):

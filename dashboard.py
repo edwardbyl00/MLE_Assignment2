@@ -656,7 +656,7 @@ if view == "Monitoring":
         else:
             display_cols = [
                 c for c in [
-                    "model_version", "model_type", "train_date",
+                    "model_version", "train_date",
                     "auc_train", "auc_test", "auc_oot",
                     "gini_oot", "brier_oot", "log_loss_oot",
                     "calibration_method", "prediction_threshold",
